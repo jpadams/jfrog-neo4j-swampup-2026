@@ -1,0 +1,5 @@
+name = "libs/authz"
+kind = "go-lib"
+owner = "platform"
+image = "golang:1.26-alpine"
+testCmd = "go test ./libs/authz/..."

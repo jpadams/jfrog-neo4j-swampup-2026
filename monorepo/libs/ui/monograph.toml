@@ -1,0 +1,5 @@
+name = "libs/ui"
+kind = "ts-lib"
+owner = "web-platform"
+image = "node:24-alpine"
+testCmd = "pnpm --filter @monorepo/ui test"

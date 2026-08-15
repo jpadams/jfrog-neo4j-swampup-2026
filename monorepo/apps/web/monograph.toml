@@ -1,0 +1,5 @@
+name = "apps/web"
+kind = "ts-app"
+owner = "web"
+image = "node:24-alpine"
+testCmd = "pnpm --filter @monorepo/web test"

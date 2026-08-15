@@ -1,0 +1,35 @@
+"""
+Three functions, all about two argument names that differ only by the case of one
+letter: `neo4juri` and `neo4jUri`.
+
+  probe               declares BOTH  -> the capital-U flag silently fills the
+                                        lowercase argument
+  probeOnlyLowercase  declares one   -> works
+  probeOnlyCapital    declares one   -> its own advertised flag hard-errors
+
+The single-argument pair matters because it removes the alternative: with nothing
+else to absorb the value, the capital-U argument is simply unreachable.
+"""
+type Mangle {
+  """
+  Both arguments declared. Echo them back so the caller can see which was set.
+  """
+  pub probe(neo4juri: String! = "", neo4jUri: String! = ""): String! {
+    `neo4juri="${neo4juri}"  neo4jUri="${neo4jUri}"`
+  }
+
+  """
+  Only the all-lowercase argument. Setting --neo-4-juri works.
+  """
+  pub probeOnlyLowercase(neo4juri: String! = ""): String! {
+    `neo4juri="${neo4juri}"`
+  }
+
+  """
+  Only the capital-U argument. Setting --neo-4-j-uri — the flag dagger itself
+  advertises for it — fails with: find arg "neo4JUri".
+  """
+  pub probeOnlyCapital(neo4jUri: String! = ""): String! {
+    `neo4jUri="${neo4jUri}"`
+  }
+}

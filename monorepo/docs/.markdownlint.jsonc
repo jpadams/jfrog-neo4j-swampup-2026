@@ -1,0 +1,15 @@
+// Lint rules for the docs target.
+//
+// This file lives inside docs/ on purpose: it is part of the docs target, so
+// editing the rules changes the docs targetHash and re-runs the lint — exactly
+// like editing the prose. Build configuration is content.
+//
+// `.markdownlint.jsonc` (rules only) is resolved per-directory by
+// markdownlint-cli2, walking up from each linted file. The `.markdownlint-cli2.*`
+// variant is resolved from the working directory instead, which would not find
+// a config nested in docs/.
+{
+  // Line length is a formatting preference that fights prose editing; the rest
+  // of the default ruleset is kept.
+  "MD013": false
+}

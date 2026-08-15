@@ -1,0 +1,11 @@
+# The workspace target owns the root-level toolchain config: go.mod,
+# package.json, pnpm-workspace.yaml, tsconfig.base.json.
+#
+# Every other target reaches it through a real reference — Go packages via the
+# module declared in go.mod, TS packages via `extends` in their tsconfig — so a
+# change to shared toolchain config correctly fans out to everything. That edge
+# is derived, not declared here.
+name = "workspace"
+kind = "workspace"
+owner = "platform"
+image = "alpine:3"

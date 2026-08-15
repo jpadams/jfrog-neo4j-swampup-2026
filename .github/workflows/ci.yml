@@ -1,0 +1,102 @@
+name: CI
+
+# The pipeline is not defined here. It lives in ci/orchestrator-dang as a Dagger
+# function, so this file only has to install a pinned Dagger and call it — and
+# the identical command runs on a laptop:
+#
+#   dagger call orchestrator-dang ci --changed=... --graph-uri=... --graph-password=env:...
+#
+# Everything provider-specific is confined to computing the changed-path list,
+# which is genuinely the provider's business: a runner is the thing that has the
+# git refs.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # One run per ref. Superseded runs are pointless work, and the graph would
+  # record them as history.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  affected:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the base commit to diff against; a shallow clone cannot.
+          fetch-depth: 0
+
+      - name: Install pinned Dagger
+        run: |
+          curl -fsSL https://dl.dagger.io/dagger/install.sh \
+            | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.9 sh
+          echo "$PWD/.bin" >> "$GITHUB_PATH"
+
+      - name: Determine changed paths
+        id: changed
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # First push to a branch reports an all-zero "before"; fall back to the
+          # first parent so the diff is still meaningful.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+
+          # --relative is essential: without it git prints repository-root paths
+          # ("monorepo/libs/core/x.ts") and monograph rejects every one of them,
+          # because the graph is keyed relative to the monorepo root.
+          #
+          # --no-renames matters just as much. With rename detection on, git prints
+          # only the DESTINATION of a rename, so moving a file between targets drops
+          # the SOURCE target from the plan even though its content hash moved:
+          # broken code, never tested, green build.
+          #
+          # Known limit of this comma-joined list: a filename containing a comma
+          # cannot be represented, and one containing a newline breaks `paste`.
+          # Both now fail loudly as unresolved paths rather than silently selecting
+          # the whole repo. `monograph affected --sha` sidesteps it entirely by
+          # reading NUL-separated paths straight from git.
+          CHANGED="$(cd monorepo && git diff --relative --no-renames --name-only "$BASE" HEAD -- . | paste -sd, -)"
+
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          if [ -z "$CHANGED" ]; then
+            echo "nothing changed under monorepo/; the graph has nothing to select"
+          else
+            echo "changed: $CHANGED"
+          fi
+
+      - name: Show what the graph selects
+        if: steps.changed.outputs.changed != ''
+        env:
+          GRAPH_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+        run: |
+          dagger call orchestrator-dang ci-plan \
+            --changed='${{ steps.changed.outputs.changed }}' \
+            --graph-uri='${{ secrets.NEO4J_URI }}' \
+            --graph-password=env:GRAPH_PASSWORD \
+            contents
+
+      - name: Run affected targets
+        if: steps.changed.outputs.changed != ''
+        env:
+          GRAPH_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+        run: |
+          # Exits non-zero if any target fails, after recording the outcome — a
+          # red run is history too.
+          dagger call orchestrator-dang ci \
+            --changed='${{ steps.changed.outputs.changed }}' \
+            --graph-uri='${{ secrets.NEO4J_URI }}' \
+            --graph-password=env:GRAPH_PASSWORD \
+            --run-id="gha-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --trigger="${{ github.event_name }}"
+
+      - name: Graph tooling tests
+        # These are host-side and independent of the monorepo selection, so they
+        # run even when nothing under monorepo/ changed.
+        run: cd tools/monograph && go test ./...

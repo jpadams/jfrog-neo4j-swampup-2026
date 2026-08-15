@@ -1,0 +1,25 @@
+# How to build and test this target. Dependencies are NEVER declared here —
+# the extractor derives them from real imports.
+#
+# `produces` is different: it declares this target's OUTPUTS. That earns its
+# keep three ways:
+#   1. Files matching these globs are excluded from the target's content hash.
+#      They are derivatives of the inputs, so hashing them would fold the output
+#      back into its own key, and a stale checked-in artifact would silently
+#      change it.
+#   2. They can be gitignored, so generated code is produced in the pipeline
+#      rather than committed — which is what removes the target-granularity
+#      ambiguity described in the README.
+#   3. The orchestrator knows to run `codegenCmd` and hand these paths to
+#      dependent targets before they compile.
+name = "proto"
+kind = "proto"
+owner = "platform"
+
+# Needs Go (protoc-gen-go) and Node (ts-proto); the orchestrator installs both.
+image = "golang:1.26-alpine"
+produces = ["proto/gen/go/**", "proto/gen/ts/src/**"]
+codegenCmd = "sh ./proto/codegen.sh"
+
+# No testCmd: the proto target's job is to emit bindings. `buf lint` would be a
+# natural addition here.

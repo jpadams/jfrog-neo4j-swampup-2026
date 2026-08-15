@@ -1,0 +1,5 @@
+name = "libs/core"
+kind = "ts-lib"
+owner = "web-platform"
+image = "node:24-alpine"
+testCmd = "pnpm --filter @monorepo/core test"

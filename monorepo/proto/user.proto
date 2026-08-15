@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package monorepo.user.v1;
+
+// Places generated Go at proto/gen/go/userpb/, which is what consumers import
+// and what the proto target declares in `produces`.
+option go_package = "github.com/jpadams/jfrog-2026/monorepo/proto/gen/go/userpb;userpb";
+
+// The shared user contract.
+//
+// How a change here actually fans out across languages — the extractor knows
+// nothing about code generation, so it is worth being precise:
+//
+//   1. libs/authz imports .../monorepo/proto/gen/go/userpb  (a real Go import)
+//   2. libs/core declares "@monorepo/proto": "workspace:*"  (a real pnpm dep)
+//   3. Both resolve to paths under proto/, and the single monograph.toml at
+//      monorepo/proto/ owns this whole directory — IDL and both generated
+//      trees alike.
+//
+// So the edges are derived from ordinary imports, not from any understanding
+// that these bindings are generated from this file.
+//
+// Both bindings are now generated in-pipeline by protoc (protoc-gen-go and
+// ts-proto) and are gitignored, so there is no committed generated source to
+// edit. What remains coarse is per-language config: bumping ts-proto.version
+// also re-runs the Go services, because everything under proto/ is one target.
+// See the README's over-approximation note.
+message User {
+  string id = 1;
+  string email = 2;
+  Role role = 3;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_VIEWER = 1;
+  ROLE_EDITOR = 2;
+  ROLE_ADMIN = 3;
+}

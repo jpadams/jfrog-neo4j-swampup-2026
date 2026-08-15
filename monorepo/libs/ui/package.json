@@ -1,0 +1,16 @@
+{
+  "name": "@monorepo/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@monorepo/core": "workspace:*",
+    "@monorepo/proto": "workspace:*"
+  }
+}

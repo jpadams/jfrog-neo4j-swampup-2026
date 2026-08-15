@@ -1,0 +1,5 @@
+name = "apps/admin"
+kind = "ts-app"
+owner = "internal-tools"
+image = "node:24-alpine"
+testCmd = "pnpm --filter @monorepo/admin test"

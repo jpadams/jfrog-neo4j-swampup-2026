@@ -1,0 +1,11 @@
+{
+  "name": "@monorepo/root",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "devDependencies": {
+    "typescript": "5.9.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --build"
+  }
+}

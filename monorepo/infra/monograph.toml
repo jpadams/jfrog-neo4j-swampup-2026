@@ -1,0 +1,5 @@
+name = "infra"
+kind = "infra"
+owner = "sre"
+image = "alpine:3"
+testCmd = "sh ./infra/validate.sh"

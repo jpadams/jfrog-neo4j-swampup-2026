@@ -1,0 +1,13 @@
+name = "docs"
+kind = "docs"
+owner = "docs"
+
+# A docs change runs a markdown lint and nothing else. That is the point of the
+# graph: not "skip CI", but "run the one cheap job that is actually relevant"
+# instead of the 7 test suites a path filter or a full re-run would trigger.
+#
+# The linter is a pinned image rather than a workspace devDependency, so the
+# docs target has no hidden dependency on the root node_modules. It really is a
+# disconnected component, and the graph says so honestly.
+image = "davidanson/markdownlint-cli2:v0.23.2"
+testCmd = "markdownlint-cli2 'docs/**/*.md'"

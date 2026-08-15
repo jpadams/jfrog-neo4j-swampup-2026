@@ -1,0 +1,541 @@
+"""
+Graph-driven CI orchestration, written in Dang.
+
+Consumes the selection plan produced by `monograph affected` and does two things
+in order:
+
+  1. Runs every codegen step the plan requires, threading each step's output into
+     the next, so generated code need not be committed.
+  2. Runs the test command of every target that is affected, runnable, and not
+     already reusable — against the source *including* that generated code.
+"""
+
+"""One entry from the selection plan."""
+type Target {
+  pub name: String!
+  pub kind: String!
+  pub image: String!
+  pub testCmd: String!
+  pub targetHash: String!
+  pub runnable: Boolean!
+  pub reusable: Boolean!
+}
+
+"""
+A producer target that must run before any target is tested.
+
+The plan orders these by dependency, and includes producers that the selected
+targets merely *depend on* — a change to libs/authz does not affect proto, but
+authz still cannot compile without proto's bindings.
+"""
+type CodegenStep {
+  pub name: String!
+  pub kind: String!
+  pub image: String!
+  pub cmd: String!
+  pub targetHash: String!
+}
+
+"""The plan emitted by `monograph affected`."""
+type Plan {
+  pub repo: String!
+  pub targets: [Target!]!
+  pub codegen: [CodegenStep!]!
+}
+
+"""
+One target's outcome, shaped for `monograph record`.
+
+Deliberately carries no cacheHit field: a module cannot tell whether the engine
+replayed a cached exec, so reporting one would mean guessing. `monograph record`
+derives it from the graph instead, and nulls the duration when it does.
+"""
+type Result {
+  pub target: String!
+  pub status: String!
+  pub targetHash: String!
+  pub toolchain: String!
+  pub durationMs: Int!
+}
+
+"""
+What a target's container reports about its own run.
+
+Dang has no ambient clock, so the container times itself and hands back both the
+exit code and the elapsed milliseconds as data. See `timingWrapper`.
+"""
+type Outcome {
+  pub rc: Int!
+  pub ms: Int!
+}
+
+type OrchestratorDang {
+  """
+  The monorepo under test.
+
+  Host build output is excluded: uploading node_modules would be slow, would
+  make the content hash machine-dependent, and would leave pnpm trying to purge
+  a foreign modules directory. Generated code is excluded too — the pipeline
+  produces it, so accepting a host copy would defeat the point.
+  """
+  pub source: Directory! @defaultPath(path: "/monorepo") @ignorePatterns(patterns: [
+    "**/node_modules",
+    "**/dist",
+    "**/.turbo",
+    "**/*.tsbuildinfo",
+    "proto/gen/go",
+    "proto/gen/ts/src",
+  ])
+
+  """
+  The pinned ts-proto version, read from the proto target itself.
+
+  See protocGenGoVersion for why the pin lives inside the target.
+  """
+  let tsProtoVersion(src: Directory!): String! {
+    src.file("proto/ts-proto.version").contents.trimSpace
+  }
+
+  """
+  The pinned protoc-gen-go version, read from the proto target itself rather than
+  restated here.
+
+  monorepo/proto/protoc-gen-go.version is the single source of truth, shared with
+  scripts/generate-local.sh, so a developer's host-generated output cannot drift
+  from the pipeline's. Because the file lives inside the proto target it is part
+  of that target's content hash — bumping the pin correctly invalidates proto and
+  every consumer of its bindings. codegen.sh verifies the installed plugin
+  matches, so drift fails loudly instead of generating different code.
+  """
+  let protocGenGoVersion(src: Directory!): String! {
+    src.file("proto/protoc-gen-go.version").contents.trimSpace
+  }
+
+  """
+  Run every codegen step, then test every selected target. Returns a run report
+  as JSON for `monograph record`.
+  """
+  pub run(plan: File!, runId: String! = "dang-local"): String! {
+    self.execute(JSON.decode(plan.contents), source, runId, "manual")
+  }
+
+  """
+  Run a decoded plan against a given source tree and return the run report JSON.
+
+  Shared by `run` (host-driven, uses the module's own source) and `ci` (which
+  supplies a tree carved out of the whole repository).
+  """
+  let execute(p: Plan!, src: Directory!, runId: String!, trigger: String!): String! {
+    self.reportJson(p, self.runResults(p, src), runId, trigger)
+  }
+
+  """Execute the selected targets and return their verdicts."""
+  let runResults(p: Plan!, src: Directory!): [Result!]! {
+    let prepared = self.withGeneratedCode(p, src)
+    p.targets
+      .filter { t => t.runnable and !t.reusable }
+      .map { t => self.testOne(t, prepared) }
+  }
+
+  """Encode a run report for `monograph record`."""
+  let reportJson(p: Plan!, results: [Result!]!, runId: String!, trigger: String!): String! {
+    JSON.encode({{
+      id: runId,
+      repo: p.repo,
+      orchestrator: "dang",
+      trigger: trigger,
+      results: results,
+    }})
+  }
+
+  """
+  List what would run, without running it.
+  """
+  pub selected(plan: File!): [String!]! {
+    let p: Plan! = JSON.decode(plan.contents)
+    p.targets.filter { t => t.runnable and !t.reusable }.map { t => t.name }
+  }
+
+  """
+  Show the ordered codegen steps this plan requires.
+  """
+  pub codegenSteps(plan: File!): [String!]! {
+    let p: Plan! = JSON.decode(plan.contents)
+    p.codegen.map { s => `${s.name} (${s.kind}): ${s.cmd}` }
+  }
+
+  """
+  Export the source tree with all generated code produced, for inspection or
+  for regenerating host-side files from the pipeline's own toolchain.
+  """
+  pub generated(plan: File!): Directory! {
+    self.withGeneratedCode(JSON.decode(plan.contents) :: Plan!, source)
+  }
+
+  """
+  Fold the codegen steps over the source tree.
+
+  Each step receives the accumulated tree and returns its container's /src, so a
+  generator that consumes an earlier generator's output sees it. With no codegen
+  steps this is just `source`, and nothing extra runs.
+  """
+  let withGeneratedCode(p: Plan!, src: Directory!): Directory! {
+    p.codegen.reduce(src) { acc, step =>
+      self.codegenToolchain(step, acc)
+        .withExec(["sh", "-c", step.cmd])
+        .directory("/src")
+    }
+  }
+
+  """
+  A container able to run one codegen step.
+
+  Toolchain installation is separate `withExec` calls rather than part of
+  `cmd`, so Dagger caches the expensive setup independently of the cheap
+  generate.
+  """
+  let codegenToolchain(step: CodegenStep!, src: Directory!): Container! {
+    let base = container.from(step.image)
+      .withDirectory("/src", src)
+      .withWorkdir("/src")
+
+    case (step.kind) {
+      # `go install` writes to $GOPATH/bin, which is /go/bin in the official Go
+      # images and is already on PATH. Do NOT override PATH here: doing so drops
+      # /go/bin and the freshly installed plugin becomes invisible to protoc.
+      # The proto target generates for two languages, so it needs both
+      # toolchains: Go for protoc-gen-go, Node for ts-proto.
+      "proto" => base
+        .withMountedCache("/go/pkg/mod", cacheVolume("monograph-gomodcache"))
+        .withExec(["apk", "add", "--no-cache", "protobuf", "nodejs", "npm"])
+        .withExec(["go", "install", `google.golang.org/protobuf/cmd/protoc-gen-go@${self.protocGenGoVersion(src)}`])
+        .withExec(["npm", "install", "-g", `ts-proto@${self.tsProtoVersion(src)}`])
+      else => base
+    }
+  }
+
+  """
+  A container with the monorepo mounted and the target's toolchain warmed up.
+
+  Cache volumes are keyed by toolchain, not by target, so every Go target shares
+  one module cache and every TypeScript target shares one pnpm store.
+  """
+  let prepared(t: Target!, src: Directory!): Container! {
+    let base = container.from(t.image)
+      .withDirectory("/src", src)
+      .withWorkdir("/src")
+
+    case (t.kind) {
+      "go-lib" => self.withGo(base)
+      "go-service" => self.withGo(base)
+      "ts-lib" => self.withNode(base)
+      "ts-app" => self.withNode(base)
+      else => base
+    }
+  }
+
+  let withGo(c: Container!): Container! {
+    c.withMountedCache("/go/pkg/mod", cacheVolume("monograph-gomodcache"))
+      .withMountedCache("/root/.cache/go-build", cacheVolume("monograph-gobuild"))
+  }
+
+  let withNode(c: Container!): Container! {
+    c.withMountedCache("/pnpm-store", cacheVolume("monograph-pnpm"))
+      # pnpm refuses to touch a modules directory without a TTY unless it knows
+      # it is in CI.
+      .withEnvVariable("CI", "true")
+      .withExec(["corepack", "enable", "pnpm"])
+      .withExec(["pnpm", "config", "set", "store-dir", "/pnpm-store"])
+      .withExec(["pnpm", "install", "--frozen-lockfile"])
+  }
+
+  """
+  The shell program that runs a target's test command and reports on it.
+
+  Three non-obvious constraints shape this, each found by experiment:
+
+  1. A *failed* exec's filesystem is discarded, so a results file written just
+     before a non-zero exit is unreadable. The wrapper therefore always exits 0
+     and carries the real exit code as data. That also removes any need for
+     `expect: ANY`.
+  2. BusyBox `date` silently ignores `%N`, so `date +%s%N` yields whole seconds
+     and millisecond arithmetic collapses to 0. `/proc/uptime` gives
+     centiseconds and works on every image this repo uses.
+  3. `10#$2` forces base 10 — a centisecond field like `08` would otherwise be
+     parsed as invalid octal and fail.
+
+  The target's command is NOT interpolated in. It arrives as positional `$1` and
+  runs via a nested `sh -c "$1"`, so a testCmd containing `;`, `&&`, quotes, or
+  `exit` cannot hijack this program's control flow.
+
+  `sh -c` and never `sh -lc`: a login shell re-reads /etc/profile and clobbers
+  the image's PATH, hiding toolchains like /usr/local/go/bin.
+  """
+  let timingWrapper: String! {
+    `now(){ set -- $(tr "." " " < /proc/uptime); echo $(( $1 * 100 + 10#$2 )); }; start=$(now); sh -c "$1" > /tmp/out 2>&1; rc=$?; end=$(now); printf '{"rc":%d,"ms":%d}' "$rc" "$(( (end - start) * 10 ))" > /tmp/result.json; cat /tmp/out; exit 0`
+  }
+
+  """
+  Run one target's test command, capturing both its verdict and its duration.
+
+  The measured time covers the test command alone, not the image pull or
+  dependency install that precede it.
+  """
+  let testOne(t: Target!, src: Directory!): Result! {
+    let outcome: Outcome! = JSON.decode(
+      self.prepared(t, src)
+        .withExec(["sh", "-c", self.timingWrapper, "monograph-timing", t.testCmd])
+        .file("/tmp/result.json")
+        .contents
+    )
+
+    Result(
+      target: t.name,
+      status: if (outcome.rc == 0) "PASSED" else "FAILED",
+      targetHash: t.targetHash,
+      toolchain: t.kind,
+      durationMs: outcome.ms,
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Dagger-native CI
+  #
+  # `ci` is the whole pipeline as one call: build the graph tool, extract, load,
+  # select, run, record. A CI provider only has to install a pinned Dagger and
+  # invoke it, so the same command produces the same pipeline on a laptop and on
+  # a runner. Nothing about the flow lives in provider YAML.
+  # ---------------------------------------------------------------------------
+
+  """
+  Build the monograph binary from source, inside the pipeline.
+
+  CGO_ENABLED=0 so the result is static and runs in any image, and the module
+  cache is shared with the Go targets so this is nearly free after the first run.
+  """
+  let monographBin(repo: Directory!): File! {
+    container.from("golang:1.26-alpine")
+      .withMountedCache("/go/pkg/mod", cacheVolume("monograph-gomodcache"))
+      .withMountedCache("/root/.cache/go-build", cacheVolume("monograph-gobuild"))
+      .withDirectory("/src", repo.directory("tools/monograph"))
+      .withWorkdir("/src")
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withExec(["go", "build", "-o", "/out/monograph", "."])
+      .file("/out/monograph")
+  }
+
+  """
+  A container holding the graph tool, the monorepo, and Neo4j credentials.
+
+  Named graphUri/graphPassword rather than neo4jUri/neo4jPassword on purpose.
+
+  The API uppercases a lowercase letter that follows a digit, so "neo4jUri"
+  becomes "neo4JUri". On its own that would be harmless, but combined with a
+  further camelCase segment the CLI can no longer resolve the argument: it
+  advertises "--neo-4-j-uri" and every spelling fails with
+  `find arg "neo4JUri"`. The flag-name derivation is not the inverse of the
+  argument-name derivation.
+
+  Verified scope, so nobody over-applies this:
+    neo4j       -> neo4J       --neo-4-j        works
+    neo4jurl    -> neo4Jurl    --neo-4-jurl     works
+    oauth2Token -> oauth2Token --oauth-2-token  works (T already uppercase)
+    port80 / v2 -> unchanged   --port-80/--v-2  works
+    foo/fooBar  -> unchanged   --foo/--foo-bar  works (digit-free control)
+    neo4jUri    -> neo4JUri    --neo-4-j-uri    BROKEN
+
+  And the failure has two shapes. Alone, `neo4jUri` hard-errors. Declared next to
+  a similar name it is worse — the flag silently fills the OTHER argument:
+
+    probe(neo4juri, neo4jUri) with --neo-4-j-uri=VALUE
+      -> neo4juri="VALUE"  neo4jUri=""     no error
+
+  That is why these are named graphUri/graphPassword and not merely lowercased: a
+  silently mis-bound flag could route a secret into the wrong parameter and still
+  go green.
+
+  This is Dagger core, NOT Dang — reproduced identically in a Go SDK module — and
+  it is type-independent: a plain String! fails exactly as a Secret! does.
+
+  The password arrives as a Dagger Secret and is mounted with
+  withSecretVariable, so it never appears in the container's configuration, in a
+  cache key, or in the trace. URI and username are ordinary strings because they
+  are not sensitive.
+  """
+  let graphTool(
+    repo: Directory!,
+    graphUri: String!,
+    graphUser: String!,
+    graphPassword: Secret!,
+    graphDatabase: String!,
+  ): Container! {
+    container.from("golang:1.26-alpine")
+      .withFile("/usr/local/bin/monograph", self.monographBin(repo))
+      .withDirectory("/work/monorepo", self.monorepoOf(repo))
+      .withWorkdir("/work")
+      .withEnvVariable("NEO4J_URI", graphUri)
+      .withEnvVariable("NEO4J_USERNAME", graphUser)
+      .withEnvVariable("NEO4J_DATABASE", graphDatabase)
+      .withSecretVariable("NEO4J_PASSWORD", graphPassword)
+  }
+
+  """
+  The monorepo subtree, with host build output and generated code excluded for
+  the same reasons as `source`.
+  """
+  let monorepoOf(repo: Directory!): Directory! {
+    repo.directory("monorepo").withoutDirectory("node_modules")
+  }
+
+  """
+  Extract the graph, load it, and emit the selection plan — all in one container
+  so graph.json never has to leave it.
+  """
+  let planFor(tool: Container!, changed: String!): File! {
+    tool
+      .withExec(["sh", "-c", "monograph extract --repo=monorepo > graph.json"])
+      .withExec(["monograph", "load", "--in", "graph.json"])
+      .withExec(["sh", "-c", `monograph affected --in graph.json --changed="$1" --cross-check > plan.json`, "monograph-ci", changed])
+      .file("/work/plan.json")
+  }
+
+  """
+  Run CI for a set of changed paths: select, execute, and record.
+
+  `changed` is a comma-separated list of paths relative to the monorepo root.
+  The caller computes it, because git history is the one input that genuinely
+  belongs to the CI provider — a runner already has the refs. Everything after
+  that point is Dagger.
+  """
+  pub ci(
+    repo: Directory! @defaultPath(path: "/") @ignorePatterns(patterns: [
+      "**/node_modules",
+      "**/dist",
+      "**/.turbo",
+      "**/*.tsbuildinfo",
+      "monorepo/proto/gen/go",
+      "monorepo/proto/gen/ts/src",
+      ".bin",
+    ]),
+    changed: String!,
+    graphUri: String!,
+    graphPassword: Secret!,
+    graphUser: String! = "neo4j",
+    graphDatabase: String! = "neo4j",
+    runId: String! = "dagger-ci",
+    trigger: String! = "ci",
+  ): String! {
+    let tool = self.graphTool(repo, graphUri, graphUser, graphPassword, graphDatabase)
+    let plan = self.planFor(tool, changed)
+    let p: Plan! = JSON.decode(plan.contents)
+    let results = self.runResults(p, self.monorepoOf(repo))
+    let report = self.reportJson(p, results, runId, trigger)
+
+    # Record through the same container, so the history write uses the same
+    # credentials and the same binary that produced the plan. This happens
+    # BEFORE the failure check: a failed run is history too, and dropping it
+    # would leave the graph unable to answer flakiness questions about failures.
+    # The plan is mounted alongside the report so `record` can write WHY each
+    # target was selected, not only what ran. `tool` is the base graph container
+    # and does not carry the plan, which was produced in a derived container, so
+    # it has to be attached explicitly.
+    tool
+      .withNewFile("/work/report.json", report)
+      .withFile("/work/plan.json", plan)
+      .withExec(["monograph", "record", "--in", "report.json", "--plan", "plan.json"])
+      .stdout
+
+    let failed = results.filter { r => r.status != "PASSED" }
+    if (failed.isEmpty) {
+      report
+    } else {
+      # Print the report before raising: raising discards the return value, and
+      # losing the per-target detail is exactly what you need when CI goes red.
+      print(report)
+      raise `ci: ${toString(failed.length)} of ${toString(results.length)} target(s) failed: ` + failed.map { r => r.target }.join(", ")
+    }
+  }
+
+  """
+  Show what CI would select, without running or recording anything.
+  """
+  pub ciPlan(
+    repo: Directory! @defaultPath(path: "/") @ignorePatterns(patterns: [
+      "**/node_modules",
+      "**/dist",
+      "**/*.tsbuildinfo",
+      ".bin",
+    ]),
+    changed: String!,
+    graphUri: String!,
+    graphPassword: Secret!,
+    graphUser: String! = "neo4j",
+    graphDatabase: String! = "neo4j",
+  ): File! {
+    self.planFor(
+      self.graphTool(repo, graphUri, graphUser, graphPassword, graphDatabase),
+      changed,
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Benchmark control: the same pipeline with NO graph
+  #
+  # `straight` runs every target unconditionally, from a hand-maintained list —
+  # which is what a Dagger-only setup looks like (see Dagger's own
+  # toolchains/*, where each concern is a module with @check functions and
+  # test selection is hand-curated name patterns).
+  #
+  # It deliberately reuses withGeneratedCode/prepared/testOne, so the ONLY
+  # difference from `run` is which targets get selected. Holding the execution
+  # machinery constant is what makes the comparison a controlled one rather
+  # than two unrelated implementations.
+  #
+  # The list below is the maintenance cost the graph removes: add a target to
+  # the monorepo and this has to be edited by hand, or the target is silently
+  # never tested.
+  # ---------------------------------------------------------------------------
+
+  """
+  Every runnable target, hand-listed. Kept in sync by humans, not derived.
+  """
+  let allTargets: [Target!]! {
+    [
+      Target(name: "apps/admin", kind: "ts-app", image: "node:24-alpine", testCmd: "pnpm --filter @monorepo/admin test", targetHash: "", runnable: true, reusable: false),
+      Target(name: "apps/web", kind: "ts-app", image: "node:24-alpine", testCmd: "pnpm --filter @monorepo/web test", targetHash: "", runnable: true, reusable: false),
+      Target(name: "docs", kind: "docs", image: "davidanson/markdownlint-cli2:v0.23.2", testCmd: "markdownlint-cli2 'docs/**/*.md'", targetHash: "", runnable: true, reusable: false),
+      Target(name: "infra", kind: "infra", image: "alpine:3", testCmd: "sh ./infra/validate.sh", targetHash: "", runnable: true, reusable: false),
+      Target(name: "libs/authz", kind: "go-lib", image: "golang:1.26-alpine", testCmd: "go test ./libs/authz/...", targetHash: "", runnable: true, reusable: false),
+      Target(name: "libs/core", kind: "ts-lib", image: "node:24-alpine", testCmd: "pnpm --filter @monorepo/core test", targetHash: "", runnable: true, reusable: false),
+      Target(name: "libs/ui", kind: "ts-lib", image: "node:24-alpine", testCmd: "pnpm --filter @monorepo/ui test", targetHash: "", runnable: true, reusable: false),
+      Target(name: "services/api", kind: "go-service", image: "golang:1.26-alpine", testCmd: "go test ./services/api/...", targetHash: "", runnable: true, reusable: false),
+      Target(name: "services/billing", kind: "go-service", image: "golang:1.26-alpine", testCmd: "go test ./services/billing/...", targetHash: "", runnable: true, reusable: false),
+    ]
+  }
+
+  """
+  Codegen must still run, because consumers cannot compile without the
+  generated bindings. A graph-free setup has to hardcode this too, including
+  the knowledge that it comes first.
+  """
+  let allCodegen: [CodegenStep!]! {
+    [
+      CodegenStep(name: "proto", kind: "proto", image: "golang:1.26-alpine", cmd: "sh ./proto/codegen.sh", targetHash: ""),
+    ]
+  }
+
+  """
+  Run every target unconditionally. The benchmark control for `run`.
+  """
+  pub straight(runId: String! = "straight-local"): String! {
+    let p = Plan(repo: "monorepo", targets: self.allTargets, codegen: self.allCodegen)
+    self.reportJson(p, self.runResults(p, source), runId, "benchmark-straight")
+  }
+
+  """
+  Names only, for a fast structural comparison that runs nothing.
+  """
+  pub straightSelected: [String!]! {
+    self.allTargets.map { t => t.name }
+  }
+}

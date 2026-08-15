@@ -1,0 +1,5 @@
+name = "services/api"
+kind = "go-service"
+owner = "platform"
+image = "golang:1.26-alpine"
+testCmd = "go test ./services/api/..."
