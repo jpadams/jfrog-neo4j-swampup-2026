@@ -237,7 +237,7 @@ training data presented at least one dead product as current.
 
 **Not verified, and therefore not designed on:**
 
-- Whether Dagger `v1.0.0-beta.9` can export its cache to an OCI registry. This
+- Whether Dagger `v1.0.0-beta.10` can export its cache to an OCI registry. This
   gates Artifactory-as-remote-cache entirely.
 - Whether Evidence signing and AppTrust are available on a free or trial tier.
 - Whether build-info module properties survive an AQL round-trip.

@@ -34,7 +34,7 @@ jobs:
       - name: Install pinned Dagger
         run: |
           curl -fsSL https://dl.dagger.io/dagger/install.sh \
-            | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.9 sh
+            | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.10 sh
           echo "$PWD/.bin" >> "$GITHUB_PATH"
 
       - name: Determine changed paths

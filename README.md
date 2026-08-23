@@ -74,12 +74,12 @@ putting them *inside* the target rather than in tooling config:
 
 ## Setup
 
-Dagger is pinned to `v1.0.0-beta.9` in a repo-local `.bin/` — the system
+Dagger is pinned to `v1.0.0-beta.10` in a repo-local `.bin/` — the system
 `dagger` is left alone. See [docs/adr-001-dagger-version.md](docs/adr-001-dagger-version.md).
 
 ```bash
 curl -fsSL https://dl.dagger.io/dagger/install.sh \
-  | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.9 sh
+  | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.10 sh
 
 (cd tools/monograph && go build -o ../../.bin/monograph .)
 
@@ -358,8 +358,13 @@ its nodes.
 # Select and run, cold then warm, with per-target durations
 ./bench/run.sh proto/user.proto
 
-# Hermetic: resolve every image from the lockfile only
-./.bin/dagger --lock frozen call orchestrator-dang run --plan=affected.json
+# Hermetic: every image and git ref resolves from dagger.lock. As of
+# v1.0.0-beta.10 locking is pinned by default and there is no --lock flag; a run
+# that had to resolve something live records it, so a clean lockfile is the
+# check. It has to be ./.bin/dagger — an older client ignores the v2 lockfile
+# entirely and neither pins nor records, which looks identical to a clean run
+./.bin/dagger call orchestrator-dang run --plan=affected.json
+git diff --exit-code dagger.lock
 
 # The headline claim, demonstrated end to end against real git history
 ./bench/rebase-scenario.sh
@@ -716,9 +721,9 @@ This treats it as evidence — which is the whole reason
 Working and verified: the graph, selection (both in-memory and via Cypher, with
 a cross-check test), Merkle target hashing, the Dang orchestrator with
 per-target durations and in-pipeline codegen, run recording, reuse,
-`--lock frozen`, and the rebase scenario. Plus the JFrog Evidence predicate
-(`monograph evidence`), **generation only** — signing and upload are not built,
-and nothing in this repo runs `jf`.
+pinned lockfile resolution, and the rebase scenario. Plus the JFrog Evidence
+predicate (`monograph evidence`), **generation only** — signing and upload are
+not built, and nothing in this repo runs `jf`.
 
 On durations: `monograph record` derives `cacheHit` from the graph rather than
 trusting the orchestrator, which cannot know whether the engine replayed its
