@@ -74,12 +74,12 @@ putting them *inside* the target rather than in tooling config:
 
 ## Setup
 
-Dagger is pinned to `v1.0.0-beta.10` in a repo-local `.bin/` — the system
+Dagger is pinned to `v1.0.0-beta.11` in a repo-local `.bin/` — the system
 `dagger` is left alone. See [docs/adr-001-dagger-version.md](docs/adr-001-dagger-version.md).
 
 ```bash
 curl -fsSL https://dl.dagger.io/dagger/install.sh \
-  | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.10 sh
+  | BIN_DIR="$PWD/.bin" DAGGER_VERSION=1.0.0-beta.11 sh
 
 (cd tools/monograph && go build -o ../../.bin/monograph .)
 
@@ -358,11 +358,12 @@ its nodes.
 # Select and run, cold then warm, with per-target durations
 ./bench/run.sh proto/user.proto
 
-# Hermetic: every image and git ref resolves from dagger.lock. As of
+# Hermetic: every image and git ref resolves from dagger.lock. Since
 # v1.0.0-beta.10 locking is pinned by default and there is no --lock flag; a run
 # that had to resolve something live records it, so a clean lockfile is the
-# check. It has to be ./.bin/dagger — an older client ignores the v2 lockfile
-# entirely and neither pins nor records, which looks identical to a clean run
+# check. It has to be ./.bin/dagger — a beta.10 client does not recognise
+# beta.11's `oci-sha`/`git-sha` entries, so it resolves live and appends its own
+# `container.from` line, which looks identical to a clean run until you diff
 ./.bin/dagger call orchestrator-dang run --plan=affected.json
 git diff --exit-code dagger.lock
 

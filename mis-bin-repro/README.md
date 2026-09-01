@@ -1,8 +1,8 @@
 # Dagger: a CLI flag silently populates the wrong argument
 
-`dagger v1.0.0-beta.10`, and unchanged since `v1.0.0-beta.9`. Dang SDK (the Go
-SDK behaves identically). Confirmed under both a beta.9 and a beta.10 module
-`engineVersion`, so it is not a module-API-version artefact.
+`dagger v1.0.0-beta.11`, and unchanged since `v1.0.0-beta.9`. Dang SDK (the Go
+SDK behaves identically). Confirmed under beta.9, beta.10 and beta.11 module
+`engineVersion`s, so it is not a module-API-version artefact.
 
 A module declares two arguments differing only by one letter's case:
 
