@@ -131,10 +131,10 @@ type OrchestratorDang {
 
   """Execute the selected targets and return their verdicts."""
   let runResults(p: Plan!, src: Directory!): [Result!]! {
-    let prepared = self.withGeneratedCode(p, src)
+    let generated = self.withGeneratedCode(p, src)
     p.targets
       .filter { t => t.runnable and !t.reusable }
-      .map { t => self.testOne(t, prepared) }
+      .map { t => self.testOne(t, generated, src) }
   }
 
   """Encode a run report for `monograph record`."""
@@ -191,13 +191,24 @@ type OrchestratorDang {
   A container able to run one codegen step.
 
   Toolchain installation is separate `withExec` calls rather than part of
-  `cmd`, so Dagger caches the expensive setup independently of the cheap
-  generate.
+  `cmd`, and the source is mounted **after** them, so Dagger caches the
+  expensive setup independently of the cheap generate.
+
+  The mount order is the whole point, and it was wrong here for a long time.
+  With `withDirectory("/src", src)` on `base`, every install below inherited
+  the full source tree in its cache key: editing one line of `libs/core` re-ran
+  `apk add protobuf nodejs npm`, `go install protoc-gen-go` and
+  `npm install -g ts-proto` before generating anything. Because every target is
+  tested against this step's output, that cost landed on all of them. Measured
+  on a beat-3 change — one line in `libs/core`, 4 targets — moving the mount
+  took the run from ~119s to ~17s. Mount source last.
+
+  The version pins are read from `src` and interpolated into the commands, so
+  a bumped pin still busts these layers: the cache key is the command string,
+  which carries the version.
   """
   let codegenToolchain(step: CodegenStep!, src: Directory!): Container! {
-    let base = container.from(step.image)
-      .withDirectory("/src", src)
-      .withWorkdir("/src")
+    let base = container.from(step.image).withWorkdir("/src")
 
     case (step.kind) {
       # `go install` writes to $GOPATH/bin, which is /go/bin in the official Go
@@ -210,7 +221,8 @@ type OrchestratorDang {
         .withExec(["apk", "add", "--no-cache", "protobuf", "nodejs", "npm"])
         .withExec(["go", "install", `google.golang.org/protobuf/cmd/protoc-gen-go@${self.protocGenGoVersion(src)}`])
         .withExec(["npm", "install", "-g", `ts-proto@${self.tsProtoVersion(src)}`])
-      else => base
+        .withDirectory("/src", src)
+      else => base.withDirectory("/src", src)
     }
   }
 
@@ -220,18 +232,21 @@ type OrchestratorDang {
   Cache volumes are keyed by toolchain, not by target, so every Go target shares
   one module cache and every TypeScript target shares one pnpm store.
   """
-  let prepared(t: Target!, src: Directory!): Container! {
-    let base = container.from(t.image)
+  let prepared(t: Target!, src: Directory!, raw: Directory!): Container! {
+    case (t.kind) {
+      "go-lib" => self.withGo(self.mounted(t.image, src))
+      "go-service" => self.withGo(self.mounted(t.image, src))
+      "ts-lib" => self.withNode(t.image, src, raw)
+      "ts-app" => self.withNode(t.image, src, raw)
+      else => self.mounted(t.image, src)
+    }
+  }
+
+  """The whole tree at /src, with no toolchain setup."""
+  let mounted(image: String!, src: Directory!): Container! {
+    container.from(image)
       .withDirectory("/src", src)
       .withWorkdir("/src")
-
-    case (t.kind) {
-      "go-lib" => self.withGo(base)
-      "go-service" => self.withGo(base)
-      "ts-lib" => self.withNode(base)
-      "ts-app" => self.withNode(base)
-      else => base
-    }
   }
 
   let withGo(c: Container!): Container! {
@@ -239,14 +254,45 @@ type OrchestratorDang {
       .withMountedCache("/root/.cache/go-build", cacheVolume("monograph-gobuild"))
   }
 
-  let withNode(c: Container!): Container! {
-    c.withMountedCache("/pnpm-store", cacheVolume("monograph-pnpm"))
+  """
+  A Node container whose install layer is keyed on the dependency manifests
+  alone, not on the source.
+
+  The manifests are mounted, installed, and only then is the tree overlaid.
+  Mounting the tree first put every source file in the install exec's cache
+  key, so one edited line re-ran `corepack enable` — which downloads the pnpm
+  tarball over the network — before any test could start.
+
+  The manifests come from `raw`, the tree BEFORE codegen, not from `src`. The
+  generated tree is the output of an exec over the whole source, so its
+  identity changes with any edit and a filter over it would inherit that. The
+  manifest set is identical either way: codegen only writes under
+  `proto/gen/**`, and `proto/gen/ts/package.json` is committed.
+
+  `**/package.json` and not just the root: pnpm resolves every member named by
+  `pnpm-workspace.yaml` before it will install, so a missing member manifest
+  fails the install rather than shrinking it.
+
+  The overlay cannot clobber the install: `withDirectory` merges rather than
+  replaces, and `**/node_modules` is excluded from `source`.
+  """
+  let withNode(image: String!, src: Directory!, raw: Directory!): Container! {
+    container.from(image)
+      .withWorkdir("/src")
+      .withMountedCache("/pnpm-store", cacheVolume("monograph-pnpm"))
       # pnpm refuses to touch a modules directory without a TTY unless it knows
       # it is in CI.
       .withEnvVariable("CI", "true")
+      .withDirectory("/src", raw.filter(include: [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "**/package.json",
+      ]))
       .withExec(["corepack", "enable", "pnpm"])
       .withExec(["pnpm", "config", "set", "store-dir", "/pnpm-store"])
       .withExec(["pnpm", "install", "--frozen-lockfile"])
+      .withDirectory("/src", src)
   }
 
   """
@@ -281,9 +327,9 @@ type OrchestratorDang {
   The measured time covers the test command alone, not the image pull or
   dependency install that precede it.
   """
-  let testOne(t: Target!, src: Directory!): Result! {
+  let testOne(t: Target!, src: Directory!, raw: Directory!): Result! {
     let outcome: Outcome! = JSON.decode(
-      self.prepared(t, src)
+      self.prepared(t, src, raw)
         .withExec(["sh", "-c", self.timingWrapper, "monograph-timing", t.testCmd])
         .file("/tmp/result.json")
         .contents
