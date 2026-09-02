@@ -376,6 +376,33 @@ git diff --exit-code dagger.lock
 ./.bin/monograph evidence --run-id "$(./graph/query.sh why | sed -n 2p | cut -d'"' -f2)" | jq .coverageGaps
 ```
 
+### Never assert a target count
+
+A verification harness must not check "N targets ran". `ci` consults the graph
+for reuse, so against content that has already passed it correctly executes
+**nothing**, returns `{"results":[]}` in a few seconds, and is green. Asserting
+a count reports that healthy outcome as a failure — which is exactly what
+happened the first time this repo's own sweep was written.
+
+Assert the safety property instead. It is the one that holds regardless of what
+the graph already knows:
+
+```bash
+./.bin/monograph evidence --run-id "$RUN" | jq '.coverageGaps, .skipped'
+```
+
+`coverageGaps` empty, and every `skipped` entry carrying a non-null `provenBy`,
+is the pass. A skip with `provenBy: null` is the real failure, and it appears in
+both.
+
+The same reasoning catches a subtler trap: `targetHash` is computed over
+**committed** content, so editing the working tree without committing leaves
+every hash unchanged and the whole plan comes back `reusable: true` — zero
+runnable targets, indistinguishable at a glance from a broken selector.
+`bench/demo.sh` commits before it selects for this reason, and any benchmark
+that means to measure real work has to do the same: stamp a unique nonce into
+the source and commit it.
+
 ### Running the tests
 
 Most of `tools/monograph`'s tests are pure — in-memory graphs, no I/O — and just
