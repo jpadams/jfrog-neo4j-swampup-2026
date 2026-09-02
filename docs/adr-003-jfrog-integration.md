@@ -63,7 +63,7 @@ This repo has now measured both, and neither is wrong — they are incomplete:
 
 | Answer | Verdict from `bench/RESULTS.md` |
 |---|---|
-| (a) the cache handles it | **True warm, false cold.** 9 targets cost the same ~1.7s as 1 on a warm engine. A fresh runner pays 51,495ms vs 13,986ms — and hosted CI is always a fresh runner. |
+| (a) the cache handles it | **True warm, false cold.** 9 targets cost the same ~0.9s as 1 on a warm engine. A fresh runner pays ~114s vs ~32s — and hosted CI is always a fresh runner. |
 | (b) hand-rolled diff logic | **That is the `straight` arm.** Nine hand-written `allTargets` entries in `main.dang`, modelled on Dagger's own `toolchains/test-split`. It works; the cost is that adding a target requires someone to remember, or coverage silently stops. |
 
 There was a third answer to that question. This repo is it, and the honest
@@ -98,12 +98,12 @@ The story this repo tells, with only the third tier being ours:
 
 | # | What you overpay for | Why | Fixed by | Measured here |
 |---|---|---|---|---|
-| 1 | Re-running **byte-identical** work | no content cache | Dagger's cache — the talk's thesis | warm engine: 9 targets ≈ 1 target ≈ ~1.7s |
-| 2 | Running work the change **could not affect** | CI has no dependency knowledge | the graph | cold runner **3.7×** for a narrow change; warm engine **nothing** |
+| 1 | Re-running **byte-identical** work | no content cache | Dagger's cache — the talk's thesis | warm engine: 9 targets ≈ 1 target ≈ ~0.9s |
+| 2 | Running work the change **could not affect** | CI has no dependency knowledge | the graph | cold runner **~3.5×** for a narrow change; warm engine **nothing** |
 | 3 | Re-running work whose **inputs never changed**, because the SHA moved | the cache key is wrong | Merkle `targetHash` + recorded history | rebase onto unrelated `main`: SHA-keyed CI runs 4 targets, this runs **zero** |
 
 Tier 1 belongs to Dagger and must be credited as such. Tier 2 is real but our own
-benchmark limits the claim — worth 3.7× on a fresh runner and *nothing* warm.
+benchmark limits the claim — worth ~3.5× on a fresh runner and *nothing* warm.
 
 **Tier 3 is the one to lead with**, because it is the only tier where a warm cache
 does not save you: when the SHA moves, every cache key moves with it, so the work

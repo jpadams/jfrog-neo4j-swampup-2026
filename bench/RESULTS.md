@@ -68,7 +68,7 @@ at globs.
 **`jenkins-all` and `straight` select identically — 72 target runs each — yet
 `straight` is far cheaper, with no graph involved.** The difference is entirely
 Dagger's content-addressed cache replaying unchanged targets. Phase 2 measures
-this directly: nine targets on a warm engine cost the same ~1.7s as one.
+this directly: nine targets on a warm engine cost the same ~0.9s as one.
 
 So most of the speed people chase with "affected target selection" is already
 available from caching alone. If you are on Jenkins today, moving to plain Dagger
@@ -104,17 +104,17 @@ from another's cold work.
 
 | Change | straight | graph | graph+reuse |
 |---|---|---|---|
-| `docs/README.md` | 1651ms | 1828ms | 1780ms |
-| `docs/.markdownlint.jsonc` | 1657ms | 1659ms | 1668ms |
-| `infra/main.tf` | 1710ms | 1752ms | 1620ms |
-| `services/billing/main.go` | 1560ms | 1638ms | 1577ms |
-| `libs/ui/src/index.ts` | 1724ms | 1850ms | 1623ms |
-| `libs/core/src/index.ts` | 1583ms | 1601ms | 1573ms |
-| `proto/user.proto` | 1808ms | 1663ms | 1583ms |
-| `tsconfig.base.json` | 1661ms | 1804ms | 1624ms |
+| `docs/README.md` | 785ms | 767ms | 867ms |
+| `docs/.markdownlint.jsonc` | 785ms | 783ms | 778ms |
+| `infra/main.tf` | 881ms | 853ms | 868ms |
+| `services/billing/main.go` | 781ms | 804ms | 796ms |
+| `libs/ui/src/index.ts` | 1001ms | 956ms | 811ms |
+| `libs/core/src/index.ts` | 786ms | 848ms | 794ms |
+| `proto/user.proto` | 780ms | 847ms | 796ms |
+| `tsconfig.base.json` | 788ms | 781ms | 790ms |
 
 **On a warm engine, selection buys nothing measurable.** Every arm lands at
-~1.6–1.8s whether it selects 1 target or 9. Fixed overhead — engine connect,
+~0.8–1.0s whether it selects 1 target or 9. Fixed overhead — engine connect,
 workspace load, source upload, module load — dominates completely, and the target
 work itself is replayed from cache to near-zero. Some graph rows are *slower*
 than `straight`, which is noise, not a real regression.
@@ -129,35 +129,46 @@ The engine cache is pruned before every run, which is the state a fresh CI runne
 starts in. Single measurement per row (each needs its own prune), so read these as
 orders of magnitude.
 
-| Arm | Targets | Cold wall | vs straight |
-|---|---|---|---|
-| graph (`docs/README.md`) | 1 | 13,986ms | **3.7× faster** |
-| graph (`libs/core/src/index.ts`) | 4 | 33,918ms | 1.5× faster |
-| graph (`proto/user.proto`) | 7 | 39,877ms | 1.3× faster |
-| `straight` (all) | 9 | 51,495ms | — |
+Recorded twice, because one measurement per prune is not enough to tell a real
+effect from a slow afternoon. The two runs agree within ~8%.
 
-**On a cold cache, selection is worth 3.7× for a narrow change**, and the benefit
-decays as the change touches more of the graph — exactly tracking the phase-1
+| Arm | Targets | Cold wall, run 1 | Cold wall, run 2 | vs straight |
+|---|---|---|---|---|
+| graph (`docs/README.md`) | 1 | 34,033ms | 30,405ms | **3.3× / 3.9× faster** |
+| graph (`libs/core/src/index.ts`) | 4 | 88,872ms | 87,853ms | 1.25× / 1.34× faster |
+| graph (`proto/user.proto`) | 7 | 83,397ms | 89,761ms | 1.33× / 1.31× faster |
+| `straight` (all) | 9 | 111,319ms | 117,753ms | — |
+
+**On a cold cache, selection is worth ~3.5× for a narrow change**, and the benefit
+decays as the change touches more of the graph — roughly tracking the phase-1
 counts.
 
-Two things to notice:
+Three things to notice:
 
-- **Cost scales with what you select**, roughly 4.7s per additional target beyond
-  the floor. This is the graph's mechanism working as advertised.
-- **There is a large fixed floor.** Even selecting a single target costs 14s, of
+- **Cost tracks what kind of target you select, not just how many.** The
+  4-target row is all TypeScript and costs about the same as the 7-target row,
+  which is mostly Go. Averaged end to end it is ~11s per additional target, but
+  that average hides the composition and should not be extrapolated.
+- **There is a large fixed floor.** Even selecting a single target costs ~30s, of
   which most is engine bootstrap, module build and source upload. The graph cannot
   optimise that away, so a one-target run is not 1/9th of a nine-target run.
+- **Do not compare these absolutes against an earlier recording.** They roughly
+  doubled from the figures this file carried before, and both runs agree, so it
+  is systematic rather than noise — but the engine moved from `v1.0.0-beta.9` to
+  `v1.0.0-beta.11` and the orchestrator's layer structure changed in between, on
+  a differently loaded machine. The *ratio* is the durable finding; the
+  milliseconds are only comparable within a single run.
 
 ## The two regimes are the actual answer
 
 | | Warm engine | Cold engine (fresh runner) |
 |---|---|---|
-| Selection's wall-clock value | **none** | **up to 3.7×** |
+| Selection's wall-clock value | **none** | **~3.5×** |
 | What still justifies the graph | safety, derivation, content-keyed reuse | all of that, plus real speed |
 
 Neither number alone is honest. Ephemeral runners are the common case, which
 favours the graph; a persistent engine or remote cache is the standard
-optimisation, which erases its speed advantage. Anyone quoting "3.7× faster CI"
+optimisation, which erases its speed advantage. Anyone quoting "3.5× faster CI"
 from this without naming the cache regime is misrepresenting it.
 
 ## The cost no timing can show
