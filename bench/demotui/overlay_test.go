@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -228,5 +230,171 @@ func TestOverlayShowsTheRealToolsQueries(t *testing.T) {
 				t.Errorf("panel is missing a line of the executed query: %q", line)
 			}
 		}
+	}
+
+	// The real queries are the ones that ship, so the paste-safety rule is
+	// asserted against them and not only against the fixtures: every line the
+	// panel shows is either a Cypher comment or part of a statement, and the
+	// terminator is added exactly once even if the tool starts emitting its own.
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+		if strings.HasPrefix(line, "READ --") || strings.HasPrefix(line, "WRITE --") || strings.HasPrefix(line, "runs:") {
+			t.Errorf("uncommented prose in the panel: %q", line)
+		}
+	}
+	yanked := overlayYankBody(modeCypher, phaseBeat4Record, qs, "")
+	if strings.Contains(yanked, ";;") {
+		t.Errorf("doubled terminator -- the tool now emits its own:\n%s", yanked)
+	}
+	if want := len(cypherFor(phaseBeat4Record, qs)); strings.Count(yanked, ";") != want {
+		t.Errorf("want %d terminators for %d real queries:\n%s", want, want, yanked)
+	}
+}
+
+// TestYankBodyIsPasteable is the property the "y" key exists for: what lands on
+// the clipboard must be text a person can paste into Neo4j Browser or jq, not a
+// screenshot of a panel.
+//
+// The traps are ANSI escapes and the border glyphs -- both arrive the moment
+// anyone reaches for the rendered body instead of the source values.
+func TestYankBodyIsPasteable(t *testing.T) {
+	body := overlayYankBody(modeCypher, phaseBeat4Record, fakeQueries(), "")
+	if body == "" {
+		t.Fatal("beat 4 record yanked nothing")
+	}
+	if strings.Contains(body, "\x1b") {
+		t.Errorf("yanked body carries ANSI escapes:\n%q", body)
+	}
+	for _, glyph := range []string{"│", "─", "╭", "╮", "╰", "╯"} {
+		if strings.Contains(body, glyph) {
+			t.Errorf("yanked body carries border glyph %q:\n%s", glyph, body)
+		}
+	}
+	// Every non-comment line has to be Cypher: the reading aids the panel shows
+	// above each query are a syntax error when pasted, so they must be commented.
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+		if strings.Contains(line, "runs: ") || strings.HasPrefix(line, "READ --") || strings.HasPrefix(line, "WRITE --") {
+			t.Errorf("uncommented header leaked into the yank: %q", line)
+		}
+	}
+	if !strings.Contains(body, "MERGE (run)-[pb:PROVEN_BY]->(proof)") {
+		t.Errorf("yank dropped the query the step actually runs:\n%s", body)
+	}
+	// Most stages yank more than one query, and Cypher's only statement
+	// separator is the semicolon: without it the second statement starts on the
+	// line after the first ends and the whole paste fails to parse.
+	if n := len(cypherFor(phaseBeat4Record, fakeQueries())); n < 2 {
+		t.Fatalf("this test needs a multi-query stage; beat 4 record has %d", n)
+	}
+	if got := strings.Count(body, ";"); got != 2 {
+		t.Errorf("want one terminator per query, got %d:\n%s", got, body)
+	}
+	if !strings.HasSuffix(body, ";") {
+		t.Errorf("last query is unterminated:\n%s", body)
+	}
+	// The same filtering as the panel, or the clipboard and the screen disagree
+	// about what the step ran.
+	if strings.Contains(overlayYankBody(modeCypher, phaseBeat3Record, fakeQueries(), ""), "PROVEN_BY") {
+		t.Error("beat 3 yanked a query it did not run")
+	}
+	if got := overlayYankBody(modeCypher, phaseBeat1Run, fakeQueries(), ""); got != "" {
+		t.Errorf("a phase with no graph work yanked %q", got)
+	}
+}
+
+// TestYankEvidenceStaysJSON: the predicate is the thing most likely to be
+// copied, and a header line above it means it no longer parses.
+func TestYankEvidenceStaysJSON(t *testing.T) {
+	pred := "{\n  \"targets\": [\"a\", \"b\"],\n  \"reused\": 1\n}"
+	got := overlayYankBody(modeEvidence, phaseEvidence, fakeQueries(), pred)
+	var v map[string]any
+	if err := json.Unmarshal([]byte(got), &v); err != nil {
+		t.Fatalf("yanked predicate does not parse as JSON: %v\n%s", err, got)
+	}
+	if len(v) != 2 {
+		t.Errorf("yanked predicate lost fields: %v", v)
+	}
+}
+
+// TestYankKeyReportsWhatItDid covers the two things the "y" key promises beyond
+// putting text somewhere: that the status line says which of the two outcomes
+// happened, and that a machine with no clipboard loses nothing.
+//
+// The fallback is the branch worth the fixture. It never runs on a laptop -- the
+// developer's pbcopy always succeeds -- so the one place it can be exercised is
+// here, and a silent failure on a presenter's ssh session is the exact outcome
+// the branch exists to prevent.
+func TestYankKeyReportsWhatItDid(t *testing.T) {
+	saved := clipboardWrite
+	defer func() { clipboardWrite = saved }()
+
+	newModel := func() Model {
+		m := NewModel(&env{})
+		m.width, m.height = 100, 30
+		m.resizeViewport()
+		m.cypher = fakeQueries()
+		m.phase = phaseBeat4Record
+		m.overlayOpen, m.overlayMode = true, modeCypher
+		m.syncOverlay()
+		return m
+	}
+	press := func(m Model, key string) Model {
+		out, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		return out.(Model)
+	}
+
+	// Success: the clipboard gets the raw body, and the panel stays open so the
+	// presenter can keep talking over the query they just copied.
+	var got string
+	clipboardWrite = func(s string) error { got = s; return nil }
+	m := press(newModel(), "y")
+	if want := overlayYankBody(modeCypher, phaseBeat4Record, fakeQueries(), ""); got != want {
+		t.Errorf("clipboard got the wrong text:\n%q", got)
+	}
+	if !m.overlayOpen {
+		t.Error("y closed the panel")
+	}
+	if !strings.Contains(m.yankMsg, "Copied") {
+		t.Errorf("status line does not report the copy: %q", m.yankMsg)
+	}
+	if view := stripANSI(m.View()); !strings.Contains(view, m.yankMsg) {
+		t.Errorf("the report never reaches the screen:\n%s", view)
+	}
+
+	// Failure: the text lands in a file, the status line names it, and the
+	// transcript keeps the full path.
+	clipboardWrite = func(string) error { return errors.New("no clipboard") }
+	before := newModel()
+	m = press(before, "y")
+	if strings.Contains(m.yankMsg, "Copied") {
+		t.Errorf("a failed write reported success: %q", m.yankMsg)
+	}
+	if !strings.Contains(m.yankMsg, "No clipboard") {
+		t.Errorf("status line hides the failure: %q", m.yankMsg)
+	}
+	if len(m.transcript) != len(before.transcript)+1 {
+		t.Fatalf("the spill file's path was not recorded: %d -> %d",
+			len(before.transcript), len(m.transcript))
+	}
+	line := stripANSI(m.transcript[len(m.transcript)-1])
+	path := strings.TrimSpace(line[strings.LastIndex(line, " ")+1:])
+	spilled, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("status line names a file that is not there (%q): %v", path, err)
+	}
+	defer os.Remove(path)
+	if want := overlayYankBody(modeCypher, phaseBeat4Record, fakeQueries(), ""); strings.TrimSpace(string(spilled)) != want {
+		t.Errorf("spill file does not hold the query:\n%s", spilled)
+	}
+
+	// And the key is discoverable: a panel that can be copied has to say so.
+	if view := stripANSI(newModel().View()); !strings.Contains(view, "y: copy") {
+		t.Errorf("the open panel never advertises the key:\n%s", view)
 	}
 }

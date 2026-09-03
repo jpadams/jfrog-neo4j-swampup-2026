@@ -683,3 +683,59 @@ func (w *traceWatcher) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+// copyToClipboard puts text on the system clipboard, shaped like openURL above:
+// the platform's own tool, invoked directly rather than through a shell, so the
+// text is never subject to quoting.
+//
+// Run, not Start, unlike openURL -- the process must have consumed stdin before
+// the status line claims the copy happened.
+// clipboardWrite is the seam the fallback path is tested through. There is no
+// portable way to make a real pbcopy fail, and the branch that runs when it does
+// is the one a presenter on a bare ssh session hits -- untested is exactly the
+// wrong thing for it to be.
+var clipboardWrite = copyToClipboard
+
+func copyToClipboard(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "windows":
+		cmd = exec.Command("clip")
+	default:
+		// xclip is the more common of the two and takes the selection that
+		// Ctrl-V pastes from; wl-copy covers Wayland, where xclip is absent.
+		if _, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard")
+		} else {
+			cmd = exec.Command("wl-copy")
+		}
+	}
+	cmd.Stdin = strings.NewReader(text)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(errBuf.String()); msg != "" {
+			return fmt.Errorf("%s: %s", cmd.Path, msg)
+		}
+		return err
+	}
+	return nil
+}
+
+// spillToFile is the fallback when there is no clipboard to write to -- over a
+// bare ssh session there may be no pbcopy and no X display at all. Losing the
+// query silently is the one outcome worth ruling out, so it lands somewhere the
+// status line can name.
+func spillToFile(text string) (string, error) {
+	f, err := os.CreateTemp("", "monograph-*.txt")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(text + "\n"); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
+}

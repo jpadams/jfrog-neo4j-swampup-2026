@@ -85,18 +85,23 @@ func cypherFor(p Phase, all []CypherQuery) []CypherQuery {
 // sizes and frames it.
 func cypherPanelBody(p Phase, all []CypherQuery, loadErr error) string {
 	if loadErr != nil {
-		return failStyle.Render("could not read the queries from monograph:") + "\n" +
-			dimStyle.Render(loadErr.Error()) + "\n\n" +
-			noteStyle.Render("`monograph queries --json` is what this panel shows.")
+		return failStyle.Render("// could not read the queries from monograph:") + "\n" +
+			dimStyle.Render("// "+loadErr.Error()) + "\n\n" +
+			noteStyle.Render("// `monograph queries --json` is what this panel shows.")
 	}
 
 	qs := cypherFor(p, all)
 	if len(qs) == 0 {
-		return noteStyle.Render("No Cypher at this stage.") + "\n\n" +
-			dimStyle.Render("EDIT is git and RUN is Dagger -- neither touches the graph.") + "\n" +
-			dimStyle.Render("The graph is read at SELECT and written at RECORD.")
+		return noteStyle.Render("// No Cypher at this stage.") + "\n\n" +
+			dimStyle.Render("// EDIT is git and RUN is Dagger -- neither touches the graph.") + "\n" +
+			dimStyle.Render("// The graph is read at SELECT and written at RECORD.")
 	}
 
+	// Every line in this panel that is not Cypher is a Cypher comment, and every
+	// query ends in a semicolon. The panel is a thing people copy off -- with "y"
+	// or, on a machine with no clipboard, by dragging a mouse over it -- and a
+	// screen where only SOME of what is selected will run is worse than one where
+	// the rule is visible. Same text as overlayYankBody produces, modulo colour.
 	var b strings.Builder
 	for i, q := range qs {
 		if i > 0 {
@@ -106,11 +111,15 @@ func cypherPanelBody(p Phase, all []CypherQuery, loadErr error) string {
 		if q.Kind == "write" {
 			kind = "WRITE"
 		}
-		b.WriteString(titleStyle.Render(kind + " -- " + q.Title))
+		b.WriteString(titleStyle.Render("// " + kind + " -- " + q.Title))
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("runs: " + q.When))
+		b.WriteString(dimStyle.Render("// runs: " + q.When))
 		b.WriteString("\n")
-		for _, line := range strings.Split(strings.TrimSpace(q.Cypher), "\n") {
+		cypher := strings.TrimSpace(q.Cypher)
+		if !strings.HasSuffix(cypher, ";") {
+			cypher += ";"
+		}
+		for _, line := range strings.Split(cypher, "\n") {
 			b.WriteString(cypherStyle.Render(line))
 			b.WriteString("\n")
 		}
@@ -187,4 +196,46 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// overlayYankBody is the plain text the "y" key puts on the clipboard: no ANSI,
+// no border, no padding -- what the panel SHOWS, not how it looks.
+//
+// Built from the source values rather than by stripping the rendered body,
+// because the rendered body carries the panel's own furniture. The `READ --
+// Title` and `runs: ...` headers are reading aids; pasted into Neo4j Browser
+// they are a syntax error, so the Cypher path emits them as `//` comments and
+// the Evidence path drops them entirely -- the predicate has to survive
+// json.Unmarshal, and a header line above it means it does not.
+func overlayYankBody(m overlayMode, p Phase, all []CypherQuery, predicate string) string {
+	if m == modeEvidence {
+		return strings.TrimSpace(predicate)
+	}
+	qs := cypherFor(p, all)
+	if len(qs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, q := range qs {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		kind := "READ"
+		if q.Kind == "write" {
+			kind = "WRITE"
+		}
+		b.WriteString("// " + kind + " -- " + q.Title + "\n")
+		b.WriteString("// runs: " + q.When + "\n")
+		cypher := strings.TrimSpace(q.Cypher)
+		b.WriteString(cypher)
+		// A separator, because most stages yank TWO queries and Cypher has no
+		// other one: without it the second statement begins on the line after the
+		// first ends, which is a syntax error the moment it is pasted. Guarded
+		// because `monograph queries --json` could start emitting its own.
+		if !strings.HasSuffix(cypher, ";") {
+			b.WriteString(";")
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }

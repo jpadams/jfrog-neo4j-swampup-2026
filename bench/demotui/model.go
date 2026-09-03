@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -87,6 +88,12 @@ type Model struct {
 	overlayOpen bool
 	overlayMode overlayMode
 	overlayVP   viewport.Model
+
+	// yankMsg replaces the panel's help text after a "y" until the panel is
+	// closed. A clipboard write that fails does so silently otherwise, and a
+	// presenter hitting Cmd-V on a stale buffer in front of an audience is the
+	// failure this exists to prevent.
+	yankMsg string
 
 	waiting  bool
 	fatalErr error
@@ -514,6 +521,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// having hung.
 				m.overlayOpen = false
 				return m, nil
+			case "y":
+				// Above default:, so the viewport never sees it and cannot bind it
+				// to something else later.
+				m.yankMsg = m.yank()
+				return m, nil
 			default:
 				var cmd tea.Cmd
 				m.overlayVP, cmd = m.overlayVP.Update(msg)
@@ -725,10 +737,12 @@ func (m Model) View() string {
 		// The hint belongs here most of all: mid-run is exactly when the trace is
 		// worth opening, and its appearing is the signal that the link has landed.
 		status += helpStyle.Render(traceHint)
+	case m.overlayOpen && m.yankMsg != "":
+		status = helpStyle.Render(m.yankMsg)
 	case m.overlayOpen && m.overlayMode == modeEvidence:
-		status = helpStyle.Render("The Evidence predicate, as the tool emitted it -- ↑/↓ to scroll -- e or esc to close.")
+		status = helpStyle.Render("The Evidence predicate, as the tool emitted it -- ↑/↓ scroll -- y: copy -- e or esc to close.")
 	case m.overlayOpen:
-		status = helpStyle.Render("Cypher for this stage -- ↑/↓ to scroll -- c or esc to close.")
+		status = helpStyle.Render("Cypher for this stage -- ↑/↓ scroll -- y: copy -- c or esc to close.")
 	case m.phase == phaseDone:
 		status = helpStyle.Render("Press Enter or q to exit. -- c: cypher" + m.evidenceHint() + traceHint)
 	case m.waiting:
@@ -829,10 +843,49 @@ func justify(left, right string, width int) string {
 // syncOverlay sizes the panel's viewport to the transcript's slot and fills it
 // with the queries for the current phase.
 //
+// yank puts the open panel's text on the clipboard and returns the line the
+// status bar should show for it.
+//
+// The RAW text, never overlayVP.View(): the rendered body is full of ANSI and
+// framed by the border, and a clipboard full of escape codes and box-drawing
+// characters is the exact problem this key exists to solve. See
+// overlayYankBody.
+func (m *Model) yank() string {
+	body := overlayYankBody(m.overlayMode, m.phase, m.cypher, m.evidence)
+	what := "Cypher"
+	if m.overlayMode == modeEvidence {
+		what = "predicate"
+	}
+	// Checked before the empty test, or the panel says the queries could not be
+	// read while the status line says there is nothing here to copy -- two
+	// different claims about the same failure, on screen at once.
+	if m.overlayMode == modeCypher && m.cypherErr != nil {
+		return "Nothing to copy: the queries could not be read."
+	}
+	if body == "" {
+		return "Nothing to copy at this stage."
+	}
+	n := strings.Count(body, "\n") + 1
+	if err := clipboardWrite(body); err != nil {
+		path, ferr := spillToFile(body)
+		if ferr != nil {
+			return "Could not copy: " + err.Error()
+		}
+		// The basename only. The whole overlay is built so that opening it moves
+		// nothing on screen (see cypherPanel), and a temp path is long enough to
+		// wrap the status line and undo that. The directory is os.TempDir() and
+		// the transcript carries the full path.
+		m.appendTranscript(dimStyle.Render("  clipboard unavailable -- " + what + " written to " + path))
+		return "No clipboard here -- wrote " + filepath.Base(path) + " in $TMPDIR"
+	}
+	return fmt.Sprintf("Copied the %s -- %d lines, plain text.", what, n)
+}
+
 // It deliberately touches only overlayVP. The transcript's own viewport, its
 // anchor and its stepAnchor are left exactly as they were, so opening the panel
 // mid-beat and closing it again returns to the same screen rather than jumping.
 func (m *Model) syncOverlay() {
+	m.yankMsg = ""
 	w, h := overlayInner(m.viewport.Width, m.viewport.Height)
 	m.overlayVP.Width, m.overlayVP.Height = w, h
 	if m.overlayMode == modeEvidence {
